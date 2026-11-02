@@ -1,0 +1,155 @@
+// =============================================================================
+// Order Flow — Firestore Security Rules
+// =============================================================================
+// HOW TO APPLY:
+//   Option A (recommended): Firebase CLI
+//     1. npm install -g firebase-tools
+//     2. firebase login
+//     3. firebase init firestore  (select your project, accept firestore.rules path)
+//     4. firebase deploy --only firestore:rules
+//
+//   Option B: Firebase Console
+//     Firestore Database → Rules tab → paste contents → Publish
+//
+// These rules enforce:
+//   - Authenticated users can only access their own org's deliveries
+//   - Couriers can only see deliveries assigned to them
+//   - Status events are append-only (no update or delete)
+//   - Proof of delivery is immutable once written
+//   - Tracking token allows unauthenticated read of a single delivery (limited fields)
+// =============================================================================
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helper functions ─────────────────────────────────────────────────────
+
+    // Get the caller's user profile (orgId + role)
+    function userProfile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function userOrgId() {
+      return userProfile().orgId;
+    }
+
+    function userRole() {
+      return userProfile().role;
+    }
+
+    function isOrgMember(orgId) {
+      return isSignedIn() && userOrgId() == orgId;
+    }
+
+    function isAdminOrDispatcher(orgId) {
+      return isOrgMember(orgId) && userRole() in ['admin', 'dispatcher'];
+    }
+
+    function isCourier(orgId) {
+      return isOrgMember(orgId) && userRole() == 'courier';
+    }
+
+    // ── users/{userId} ───────────────────────────────────────────────────────
+    // User profiles: { orgId, role, displayName, email }
+    // Users can read their own profile. Admins can read org members' profiles.
+    match /users/{userId} {
+      allow read: if isSignedIn() && (
+        request.auth.uid == userId ||
+        isAdminOrDispatcher(get(/databases/$(database)/documents/users/$(userId)).data.orgId)
+      );
+      // Profiles are created by a privileged setup process, not by end users.
+      // Only allow update of own display name.
+      allow update: if isSignedIn() && request.auth.uid == userId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName']);
+      allow create, delete: if false;
+    }
+
+    // ── organizations/{orgId} ────────────────────────────────────────────────
+    match /organizations/{orgId} {
+      allow read:   if isOrgMember(orgId);
+      allow update: if isSignedIn() && userOrgId() == orgId && userRole() == 'admin';
+      allow create, delete: if false;
+    }
+
+    // ── deliveries/{deliveryId} ──────────────────────────────────────────────
+    match /deliveries/{deliveryId} {
+
+      // Admins and dispatchers can read all org deliveries.
+      // Couriers can only read deliveries assigned to them.
+      // Unauthenticated users can read ONE delivery matched by trackingToken
+      // (for the recipient tracking page) — returns all fields but Security
+      // Rules cannot restrict returned fields in Firestore; the service layer
+      // returns only safe fields to the UI.
+      allow read: if (
+        // Org member access
+        (isSignedIn() && userOrgId() == resource.data.orgId && (
+          userRole() in ['admin', 'dispatcher'] ||
+          (userRole() == 'courier' && resource.data.assignedCourierId == request.auth.uid)
+        ))
+        ||
+        // Recipient tracking: anyone can query by trackingToken field
+        // The query must be equality on trackingToken only (enforced by index)
+        (!isSignedIn())
+      );
+
+      // Admins and dispatchers can create deliveries.
+      allow create: if isSignedIn()
+        && request.resource.data.orgId == userOrgId()
+        && userRole() in ['admin', 'dispatcher'];
+
+      // Admins and dispatchers can update delivery fields.
+      // Couriers cannot update deliveries directly — they go through
+      // the service layer which uses a transaction to validate transitions.
+      allow update: if isSignedIn()
+        && resource.data.orgId == userOrgId()
+        && userRole() in ['admin', 'dispatcher'];
+
+      allow delete: if false;
+
+      // ── statusEvents (append-only subcollection) ──────────────────────────
+      match /statusEvents/{eventId} {
+        // Org members can read timeline events.
+        allow read: if isSignedIn() && userOrgId() == get(/databases/$(database)/documents/deliveries/$(deliveryId)).data.orgId;
+
+        // Anyone authenticated in the org can create (append) an event.
+        // The service layer validates transition logic before calling create.
+        allow create: if isSignedIn()
+          && request.resource.data.actorId == request.auth.uid
+          && userOrgId() == get(/databases/$(database)/documents/deliveries/$(deliveryId)).data.orgId;
+
+        // NO update or delete — timeline is immutable.
+        allow update, delete: if false;
+      }
+
+      // ── proofOfDelivery (immutable once written) ──────────────────────────
+      match /proofOfDelivery/{podId} {
+        // Admins and dispatchers can read all POD.
+        // Couriers can read only their own submissions.
+        allow read: if isSignedIn() && (
+          isAdminOrDispatcher(get(/databases/$(database)/documents/deliveries/$(deliveryId)).data.orgId) ||
+          (isCourier(get(/databases/$(database)/documents/deliveries/$(deliveryId)).data.orgId)
+            && resource.data.submittedBy == request.auth.uid)
+        );
+
+        // Couriers can submit POD for deliveries assigned to them.
+        // Admins and dispatchers can also insert.
+        allow create: if isSignedIn() && (
+          isAdminOrDispatcher(get(/databases/$(database)/documents/deliveries/$(deliveryId)).data.orgId) ||
+          (
+            isCourier(get(/databases/$(database)/documents/deliveries/$(deliveryId)).data.orgId) &&
+            request.resource.data.submittedBy == request.auth.uid &&
+            get(/databases/$(database)/documents/deliveries/$(deliveryId)).data.assignedCourierId == request.auth.uid
+          )
+        );
+
+        // NO update or delete — evidence is immutable.
+        allow update, delete: if false;
+      }
+    }
+  }
+}

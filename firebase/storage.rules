@@ -1,0 +1,89 @@
+// =============================================================================
+// Order Flow — Firebase Storage Security Rules
+// =============================================================================
+// HOW TO APPLY:
+//   Option A (recommended): Firebase CLI
+//     firebase deploy --only storage
+//
+//   Option B: Firebase Console
+//     Storage → Rules tab → paste contents → Publish
+//
+// Path structure: pod-evidence/{orgId}/{deliveryId}/{filename}
+//
+// Rules enforce:
+//   - Only the assigned courier for a delivery may upload photos.
+//   - Admins and dispatchers in the org can upload and download.
+//   - Couriers can only download files they submitted.
+//   - No unauthenticated access.
+//   - Files limited to 10MB, image types only.
+//   - No delete by end users.
+// =============================================================================
+
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // ── Helper functions ─────────────────────────────────────────────────────
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function userProfile() {
+      return firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function userOrgId() {
+      return userProfile().orgId;
+    }
+
+    function userRole() {
+      return userProfile().role;
+    }
+
+    function isAdminOrDispatcher(orgId) {
+      return isSignedIn() && userOrgId() == orgId && userRole() in ['admin', 'dispatcher'];
+    }
+
+    function isCourierInOrg(orgId) {
+      return isSignedIn() && userOrgId() == orgId && userRole() == 'courier';
+    }
+
+    function deliveryData(deliveryId) {
+      return firestore.get(/databases/(default)/documents/deliveries/$(deliveryId)).data;
+    }
+
+    function isAssignedCourier(deliveryId) {
+      return deliveryData(deliveryId).assignedCourierId == request.auth.uid;
+    }
+
+    function isValidImageUpload() {
+      return request.resource.size <= 10 * 1024 * 1024  // 10 MB
+        && request.resource.contentType.matches('image/.*');
+    }
+
+    // ── pod-evidence/{orgId}/{deliveryId}/{filename} ─────────────────────────
+    match /pod-evidence/{orgId}/{deliveryId}/{filename} {
+
+      // Upload: assigned courier OR admin/dispatcher in org
+      allow write: if isSignedIn() && isValidImageUpload() && (
+        isAdminOrDispatcher(orgId) ||
+        (isCourierInOrg(orgId) && isAssignedCourier(deliveryId))
+      );
+
+      // Download: admin/dispatcher in org OR the assigned courier for this delivery
+      allow read: if isSignedIn() && (
+        isAdminOrDispatcher(orgId) ||
+        (isCourierInOrg(orgId) && isAssignedCourier(deliveryId))
+      );
+
+      // Delete: not permitted by end users.
+      allow delete: if false;
+    }
+
+    // Block all other paths
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

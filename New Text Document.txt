@@ -1,0 +1,10 @@
+kiro-cli --resume-id 6101fba1-db40-428f-8e45-9aabfdf48f5a
+
+
+U5z50THOZo8hyBebGaiq
+
+User id
+oo97T0BTQ1eIpkcnSUaKrN1DhGi1
+
+
+https://github.com/git-for-windows/git/releases/download/v2.56.0.windows.4/Git-2.56.0.4-64-bit.exe
